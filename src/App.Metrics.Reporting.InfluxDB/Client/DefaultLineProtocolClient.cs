@@ -9,6 +9,8 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using App.Metrics.Logging;
+using Polly;
+using Polly.CircuitBreaker;
 
 namespace App.Metrics.Reporting.InfluxDB.Client
 {
@@ -16,13 +18,9 @@ namespace App.Metrics.Reporting.InfluxDB.Client
     {
         private static readonly ILog Logger = LogProvider.For<DefaultLineProtocolClient>();
 
-        private static long _backOffTicks;
-        private static long _failureAttempts;
-        private static long _failuresBeforeBackoff;
-        private static TimeSpan _backOffPeriod;
-
         private readonly HttpClient _httpClient;
         private readonly InfluxDbOptions _influxDbOptions;
+        private readonly Policy<LineProtocolWriteResult> _executionPolicy;
 
         public DefaultLineProtocolClient(
             InfluxDbOptions influxDbOptions,
@@ -31,112 +29,94 @@ namespace App.Metrics.Reporting.InfluxDB.Client
         {
             _influxDbOptions = influxDbOptions ?? throw new ArgumentNullException(nameof(influxDbOptions));
             _httpClient = httpClient;
-            _backOffPeriod = httpPolicy?.BackoffPeriod ?? throw new ArgumentNullException(nameof(httpPolicy));
-            _failuresBeforeBackoff = httpPolicy.FailuresBeforeBackoff;
-            _failureAttempts = 0;
+            var backOffPeriod = httpPolicy?.BackoffPeriod ?? throw new ArgumentNullException(nameof(httpPolicy));
+            var failuresBeforeBackoff = httpPolicy.FailuresBeforeBackoff;
+
+            var circutBreaker = Policy<LineProtocolWriteResult>
+                .Handle<Exception>()
+                .OrResult(result => !result.Success)
+                .CircuitBreakerAsync(failuresBeforeBackoff, backOffPeriod);
+            _executionPolicy = Policy<LineProtocolWriteResult>
+                .Handle<BrokenCircuitException>()
+                .FallbackAsync(LineProtocolWriteResult.Error("Too many failures in writing to InfluxDB, Circuit Opened"))
+                .WrapAsync(circutBreaker);
         }
 
-        public async Task<LineProtocolWriteResult> WriteAsync(
+        public Task<LineProtocolWriteResult> WriteAsync(
             string payload,
             CancellationToken cancellationToken = default)
         {
-            if (string.IsNullOrWhiteSpace(payload))
+            return _executionPolicy.ExecuteAsync(
+                async (cancelation) =>
             {
-                return new LineProtocolWriteResult(true);
-            }
-
-            if (NeedToBackoff())
-            {
-                return new LineProtocolWriteResult(false, "Too many failures in writing to InfluxDB, Circuit Opened");
-            }
-
-            try
-            {
-                var content = new StringContent(payload, Encoding.UTF8);
-
-                var response = await _httpClient.PostAsync(_influxDbOptions.Endpoint, content, cancellationToken);
-
-                if (response.StatusCode == HttpStatusCode.NotFound && _influxDbOptions.CreateDataBaseIfNotExists)
+                if (string.IsNullOrWhiteSpace(payload))
                 {
-                    await TryCreateDatabase(cancellationToken);
-
-                    response = await _httpClient.PostAsync(_influxDbOptions.Endpoint, content, cancellationToken);
+                    return LineProtocolWriteResult.Ok();
                 }
-
-                if (!response.IsSuccessStatusCode)
+                try
                 {
-                    Interlocked.Increment(ref _failureAttempts);
+                    var content = new StringContent(payload, Encoding.UTF8);
 
-                    var errorMessage = $"Failed to write to InfluxDB - StatusCode: {response.StatusCode} Reason: {response.ReasonPhrase}";
-                    Logger.Error(errorMessage);
+                    var response = await _httpClient.PostAsync(_influxDbOptions.Endpoint, content, cancelation);
 
-                    return new LineProtocolWriteResult(false, errorMessage);
+                    if (response.StatusCode == HttpStatusCode.NotFound && _influxDbOptions.CreateDataBaseIfNotExists)
+                    {
+                        await TryCreateDatabase(cancelation);
+
+                        response = await _httpClient.PostAsync(_influxDbOptions.Endpoint, content, cancelation);
+                    }
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        var errorMessage = $"Failed to write to InfluxDB - StatusCode: {response.StatusCode} Reason: {response.ReasonPhrase}";
+                        Logger.Error(errorMessage);
+
+                        return LineProtocolWriteResult.Error(errorMessage);
+                    }
+
+                    Logger.Trace("Successful write to InfluxDB");
+
+                    return LineProtocolWriteResult.Ok();
                 }
-
-                Logger.Trace("Successful write to InfluxDB");
-
-                return new LineProtocolWriteResult(true);
-            }
-            catch (Exception ex)
-            {
-                Interlocked.Increment(ref _failureAttempts);
-                Logger.Error(ex, "Failed to write to InfluxDB");
-                return new LineProtocolWriteResult(false, ex.ToString());
-            }
+                catch (Exception ex)
+                {
+                    Logger.Error(ex, "Failed to write to InfluxDB");
+                    throw;
+                }
+            }, cancellationToken);
         }
 
-        private async Task<LineProtocolWriteResult> TryCreateDatabase(CancellationToken cancellationToken = default)
+        private Task<LineProtocolWriteResult> TryCreateDatabase(CancellationToken cancellationToken = default)
         {
-            try
-            {
-                Logger.Trace($"Attempting to create InfluxDB Database '{_influxDbOptions.Database}'");
-
-                var content = new StringContent(string.Empty, Encoding.UTF8);
-
-                var response = await _httpClient.PostAsync($"query?q=CREATE DATABASE \"{Uri.EscapeDataString(_influxDbOptions.Database)}\"", content, cancellationToken);
-
-                if (!response.IsSuccessStatusCode)
+            return _executionPolicy.ExecuteAsync(
+                async (token) =>
                 {
-                    var errorMessage = $"Failed to create InfluxDB Database '{_influxDbOptions.Database}' - StatusCode: {response.StatusCode} Reason: {response.ReasonPhrase}";
-                    Logger.Error(errorMessage);
+                    try
+                    {
+                        Logger.Trace($"Attempting to create InfluxDB Database '{_influxDbOptions.Database}'");
 
-                    return new LineProtocolWriteResult(false, errorMessage);
-                }
+                        var content = new StringContent(string.Empty, Encoding.UTF8);
 
-                Logger.Trace($"Successfully created InfluxDB Database '{_influxDbOptions.Database}'");
+                    var response = await _httpClient.PostAsync($"query?q=CREATE DATABASE \"{Uri.EscapeDataString(_influxDbOptions.Database)}\"", content, token);
 
-                return new LineProtocolWriteResult(true);
-            }
-            catch (Exception ex)
-            {
-                Logger.Error(ex, $"Failed to create InfluxDB Database'{_influxDbOptions.Database}'");
-                return new LineProtocolWriteResult(false, ex.ToString());
-            }
-        }
+                        if (!response.IsSuccessStatusCode)
+                        {
+                            var errorMessage = $"Failed to create InfluxDB Database '{_influxDbOptions.Database}' - StatusCode: {response.StatusCode} Reason: {response.ReasonPhrase}";
+                            Logger.Error(errorMessage);
 
-        private bool NeedToBackoff()
-        {
-            if (Interlocked.Read(ref _failureAttempts) < _failuresBeforeBackoff)
-            {
-                return false;
-            }
+                            return LineProtocolWriteResult.Error(errorMessage);
+                        }
 
-            Logger.Error($"InfluxDB write backoff for {_backOffPeriod.Seconds} secs");
+                        Logger.Trace($"Successfully created InfluxDB Database '{_influxDbOptions.Database}'");
 
-            if (Interlocked.Read(ref _backOffTicks) == 0)
-            {
-                Interlocked.Exchange(ref _backOffTicks, DateTime.UtcNow.Add(_backOffPeriod).Ticks);
-            }
-
-            if (DateTime.UtcNow.Ticks <= Interlocked.Read(ref _backOffTicks))
-            {
-                return true;
-            }
-
-            Interlocked.Exchange(ref _failureAttempts, 0);
-            Interlocked.Exchange(ref _backOffTicks, 0);
-
-            return false;
+                        return LineProtocolWriteResult.Ok();
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Error(ex, $"Failed to create InfluxDB Database'{_influxDbOptions.Database}'");
+                        throw;
+                    }
+                }, cancellationToken);
         }
     }
 }
