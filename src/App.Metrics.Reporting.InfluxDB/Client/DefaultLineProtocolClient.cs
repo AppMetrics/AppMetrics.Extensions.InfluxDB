@@ -3,6 +3,7 @@
 // </copyright>
 
 using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
 using System.Text;
@@ -47,15 +48,15 @@ namespace App.Metrics.Reporting.InfluxDB.Client
             CancellationToken cancellationToken = default)
         {
             return _executionPolicy.ExecuteAsync(
-                async (cancelation) =>
+                async (context, cancelation) =>
             {
-                if (string.IsNullOrWhiteSpace(payload))
+                if (string.IsNullOrWhiteSpace((string)context["payload"]))
                 {
                     return LineProtocolWriteResult.Ok();
                 }
                 try
                 {
-                    var content = new StringContent(payload, Encoding.UTF8);
+                    var content = new StringContent((string)context["payload"], Encoding.UTF8);
 
                     var response = await _httpClient.PostAsync(_influxDbOptions.Endpoint, content, cancelation);
 
@@ -83,13 +84,15 @@ namespace App.Metrics.Reporting.InfluxDB.Client
                     Logger.Error(ex, "Failed to write to InfluxDB");
                     throw;
                 }
-            }, cancellationToken);
+            },
+                new Dictionary<string, object> { ["payload"] = payload },
+                cancellationToken);
         }
 
         private Task<LineProtocolWriteResult> TryCreateDatabase(CancellationToken cancellationToken = default)
         {
             return _executionPolicy.ExecuteAsync(
-                async (token) =>
+                async (cancelation) =>
                 {
                     try
                     {
@@ -97,7 +100,7 @@ namespace App.Metrics.Reporting.InfluxDB.Client
 
                         var content = new StringContent(string.Empty, Encoding.UTF8);
 
-                    var response = await _httpClient.PostAsync($"query?q=CREATE DATABASE \"{Uri.EscapeDataString(_influxDbOptions.Database)}\"", content, token);
+                        var response = await _httpClient.PostAsync($"query?q=CREATE DATABASE \"{Uri.EscapeDataString(_influxDbOptions.Database)}\"", content, cancelation);
 
                         if (!response.IsSuccessStatusCode)
                         {
