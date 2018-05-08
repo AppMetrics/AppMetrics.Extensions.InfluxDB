@@ -21,5 +21,15 @@ namespace App.Metrics.Reporting.InfluxDB.Client
         public string ErrorMessage { get; }
 
         public bool Success { get; }
+
+        public static LineProtocolWriteResult Ok()
+        {
+            return new LineProtocolWriteResult(true);
+        }
+
+        public static LineProtocolWriteResult Error(string message)
+        {
+            return new LineProtocolWriteResult(false, message);
+        }
     }
 }
